@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
 from sklearn.decomposition import IncrementalPCA
 
 from .s3 import (
@@ -410,9 +411,26 @@ def carregar_artefatos_preprocessamento(
         dataset_name=dataset_name,
     )
 
-    raw_stats = carregar_json_s3(artifact_paths["stats"])
-    raw_categories = carregar_json_s3(artifact_paths["categories"])
-    feature_columns = carregar_json_s3(artifact_paths["feature_columns"])
+    try:
+        raw_stats = carregar_json_s3(artifact_paths["stats"])
+        raw_categories = carregar_json_s3(artifact_paths["categories"])
+        feature_columns = carregar_json_s3(artifact_paths["feature_columns"])
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            expected_paths = "\n".join(
+                f"- {path}" for path in artifact_paths.values()
+            )
+            raise FileNotFoundError(
+                "Artefatos de preprocessamento não encontrados no S3.\n"
+                "Execute novamente o preprocessamento do dataset de treino com "
+                '`artifact_path=dataset["ARTIFACT_PATH"]` antes de rodar '
+                "avaliação cross-domain.\n"
+                f"Artefatos esperados:\n{expected_paths}"
+            ) from exc
+
+        raise
 
     stats = {
         col: (float(values["mean"]), float(values["std"]))
@@ -425,6 +443,57 @@ def carregar_artefatos_preprocessamento(
     }
 
     return stats, categories, list(feature_columns)
+
+
+def gerar_artefatos_preprocessamento_dataset(
+    dataset: dict[str, str],
+    numeric_features: list[str],
+    categorical_features: list[str],
+    target: str = "Label",
+) -> dict[str, str]:
+    """Gera artefatos de preprocessamento para um dataset ja processado.
+
+    Usa o split de treino original para stats/categorias e o treino processado
+    para recuperar a ordem das features usadas pelo modelo/PCA.
+    """
+    dataset_name = dataset["DATASET_KEY"]
+    split_path = dataset["SPLIT_PATH"]
+
+    train_path = join_s3_path(split_path, f"{dataset_name}_train.parquet")
+    train_processed = join_s3_path(
+        split_path,
+        f"{dataset_name}_train_processed.parquet",
+    )
+
+    con = conectar_duckdb_s3()
+
+    try:
+        stats = calcular_estatisticas_treino(
+            con=con,
+            train_path=train_path,
+            numeric_features=numeric_features,
+        )
+        categories = calcular_categorias_treino(
+            con=con,
+            train_path=train_path,
+            categorical_features=categorical_features,
+        )
+        feature_columns = listar_colunas_features(
+            con=con,
+            parquet_path=train_processed,
+            target=target,
+        )
+
+        return salvar_artefatos_preprocessamento(
+            stats=stats,
+            categories=categories,
+            feature_columns=feature_columns,
+            artifact_path=dataset["ARTIFACT_PATH"],
+            dataset_name=dataset_name,
+        )
+
+    finally:
+        con.close()
 
 
 def converter_parquet(
@@ -1422,10 +1491,26 @@ def aplicar_pipeline_cross_domain(
         f"{train_key}_to_{test_key}_{split_name}_pca.parquet",
     )
 
-    stats, categories, feature_columns = carregar_artefatos_preprocessamento(
-        artifact_path=train_dataset["ARTIFACT_PATH"],
-        dataset_name=train_key,
-    )
+    try:
+        stats, categories, feature_columns = carregar_artefatos_preprocessamento(
+            artifact_path=train_dataset["ARTIFACT_PATH"],
+            dataset_name=train_key,
+        )
+    except FileNotFoundError:
+        print(
+            "Artefatos de preprocessamento ausentes; gerando a partir do treino.",
+            flush=True,
+        )
+        gerar_artefatos_preprocessamento_dataset(
+            dataset=train_dataset,
+            numeric_features=numeric_features,
+            categorical_features=categorical_features,
+            target=target,
+        )
+        stats, categories, feature_columns = carregar_artefatos_preprocessamento(
+            artifact_path=train_dataset["ARTIFACT_PATH"],
+            dataset_name=train_key,
+        )
 
     pca_paths = pca_artifact_paths(
         artifact_path=train_dataset["ARTIFACT_PATH"],
