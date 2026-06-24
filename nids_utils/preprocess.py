@@ -313,6 +313,120 @@ def calcular_categorias_treino(
     return categorias
 
 
+def preprocess_artifact_paths(
+    artifact_path: str,
+    dataset_name: str,
+) -> dict[str, str]:
+    """Monta os caminhos S3 dos artefatos de preprocessamento.
+
+    Args:
+        artifact_path: Prefixo S3 onde os artefatos serão salvos.
+        dataset_name: Nome do dataset.
+
+    Returns:
+        Dicionário com caminhos S3 de stats, categorias e features.
+    """
+    return {
+        "stats": join_s3_path(
+            artifact_path,
+            f"{dataset_name}_preprocess_stats.json",
+        ),
+        "categories": join_s3_path(
+            artifact_path,
+            f"{dataset_name}_preprocess_categories.json",
+        ),
+        "feature_columns": join_s3_path(
+            artifact_path,
+            f"{dataset_name}_processed_feature_columns.json",
+        ),
+    }
+
+
+def salvar_json_s3(data: object, s3_uri: str) -> None:
+    """Salva um objeto JSON em arquivo temporário e envia ao S3."""
+    with tempfile.TemporaryDirectory(prefix="nids_json_artifact_") as temp_dir:
+        local_path = Path(temp_dir) / Path(s3_uri).name
+
+        with local_path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+
+        upload_file_to_s3(local_path, s3_uri)
+
+
+def carregar_json_s3(s3_uri: str) -> object:
+    """Baixa e lê um artefato JSON salvo no S3."""
+    with tempfile.TemporaryDirectory(prefix="nids_json_artifact_") as temp_dir:
+        local_path = Path(temp_dir) / Path(s3_uri).name
+        download_file_from_s3(s3_uri, local_path)
+
+        with local_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+
+
+def salvar_artefatos_preprocessamento(
+    stats: dict[str, tuple[float, float]],
+    categories: dict[str, list[int]],
+    feature_columns: list[str],
+    artifact_path: str,
+    dataset_name: str,
+) -> dict[str, str]:
+    """Salva artefatos necessários para reaplicar o preprocessamento.
+
+    Esses artefatos permitem processar datasets externos com o mesmo pipeline
+    do domínio usado no treino, o que é necessário para cross-testes.
+    """
+    artifact_paths = preprocess_artifact_paths(
+        artifact_path=artifact_path,
+        dataset_name=dataset_name,
+    )
+
+    serializable_stats = {
+        col: {
+            "mean": float(values[0]),
+            "std": float(values[1]),
+        }
+        for col, values in stats.items()
+    }
+
+    salvar_json_s3(serializable_stats, artifact_paths["stats"])
+    salvar_json_s3(categories, artifact_paths["categories"])
+    salvar_json_s3(feature_columns, artifact_paths["feature_columns"])
+
+    print("Artefatos de preprocessamento enviados ao bucket:", flush=True)
+    print(f"Stats: {artifact_paths['stats']}", flush=True)
+    print(f"Categorias: {artifact_paths['categories']}", flush=True)
+    print(f"Features: {artifact_paths['feature_columns']}", flush=True)
+
+    return artifact_paths
+
+
+def carregar_artefatos_preprocessamento(
+    artifact_path: str,
+    dataset_name: str,
+) -> tuple[dict[str, tuple[float, float]], dict[str, list[int]], list[str]]:
+    """Carrega artefatos de preprocessamento salvos no S3."""
+    artifact_paths = preprocess_artifact_paths(
+        artifact_path=artifact_path,
+        dataset_name=dataset_name,
+    )
+
+    raw_stats = carregar_json_s3(artifact_paths["stats"])
+    raw_categories = carregar_json_s3(artifact_paths["categories"])
+    feature_columns = carregar_json_s3(artifact_paths["feature_columns"])
+
+    stats = {
+        col: (float(values["mean"]), float(values["std"]))
+        for col, values in raw_stats.items()
+    }
+
+    categories = {
+        col: [int(value) for value in values]
+        for col, values in raw_categories.items()
+    }
+
+    return stats, categories, list(feature_columns)
+
+
 def converter_parquet(
     input_path: str,
     output_path: str,
@@ -669,6 +783,7 @@ def preparar_datasets_treino(
     dataset_name: str,
     numeric_features: list[str],
     categorical_features: list[str],
+    artifact_path: str | None = None,
     target: str = "Label",
 ) -> tuple[str, str, str]:
     """Prepara os datasets finais para treino da MLP.
@@ -677,6 +792,7 @@ def preparar_datasets_treino(
     - padronização das numéricas usando estatísticas do treino;
     - one-hot encoding das categóricas usando categorias do treino;
     - mantém Label como alvo.
+    - opcionalmente salva os artefatos do preprocessamento no S3.
     """
 
     con = conectar_duckdb_s3()
@@ -734,6 +850,21 @@ def preparar_datasets_treino(
             categories=categories,
             target=target,
         )
+
+        feature_columns = listar_colunas_features(
+            con=con,
+            parquet_path=train_processed,
+            target=target,
+        )
+
+        if artifact_path is not None:
+            salvar_artefatos_preprocessamento(
+                stats=stats,
+                categories=categories,
+                feature_columns=feature_columns,
+                artifact_path=artifact_path,
+                dataset_name=dataset_name,
+            )
 
         print("Arquivos processados para treino:")
         print(f"Train processed: {train_processed}")
@@ -1124,6 +1255,21 @@ def salvar_artefatos_pca_no_bucket(
         shutil.rmtree(local_dir, ignore_errors=True)
 
 
+def pca_artifact_paths(
+    artifact_path: str,
+    dataset_name: str,
+) -> dict[str, str]:
+    """Monta os caminhos S3 dos artefatos PCA de um dataset."""
+    return {
+        "pca": join_s3_path(artifact_path, f"{dataset_name}_pca.joblib"),
+        "feature_columns": join_s3_path(
+            artifact_path,
+            f"{dataset_name}_pca_feature_columns.json",
+        ),
+        "metadata": join_s3_path(artifact_path, f"{dataset_name}_pca_metadata.json"),
+    }
+
+
 def aplicar_pca_datasets(
     train_path: str,
     val_path: str,
@@ -1223,6 +1369,106 @@ def aplicar_pca_datasets(
         print("=" * 80, flush=True)
 
         return train_pca, val_pca, test_pca
+
+    finally:
+        con.close()
+
+
+def aplicar_pipeline_cross_domain(
+    train_dataset: dict[str, str],
+    test_dataset: dict[str, str],
+    output_path: str,
+    numeric_features: list[str],
+    categorical_features: list[str],
+    target: str = "Label",
+    split_name: str = "test",
+    batch_size: int = 100_000,
+) -> tuple[str, str]:
+    """Processa um split externo usando o pipeline do dataset de treino.
+
+    Essa função é o caminho recomendado para cross-teste:
+    - carrega stats/categorias/features do dataset usado no treino;
+    - aplica esse preprocessamento no split do dataset externo;
+    - aplica o PCA ajustado no dataset usado no treino.
+
+    Args:
+        train_dataset: Dataset usado para treinar o modelo.
+        test_dataset: Dataset que será avaliado.
+        output_path: Prefixo S3 onde os arquivos cross serão salvos.
+        numeric_features: Features numéricas originais.
+        categorical_features: Features categóricas originais.
+        target: Nome da coluna alvo.
+        split_name: Split do dataset externo. Por padrão, "test".
+        batch_size: Tamanho aproximado dos batches do PCA.
+
+    Returns:
+        Tupla com caminhos do arquivo processed e PCA gerados.
+    """
+    train_key = train_dataset["DATASET_KEY"]
+    test_key = test_dataset["DATASET_KEY"]
+
+    source_split = join_s3_path(
+        test_dataset["SPLIT_PATH"],
+        f"{test_key}_{split_name}.parquet",
+    )
+
+    cross_prefix = join_s3_path(output_path, f"{train_key}_to_{test_key}")
+    processed_output = join_s3_path(
+        cross_prefix,
+        f"{train_key}_to_{test_key}_{split_name}_processed.parquet",
+    )
+    pca_output = join_s3_path(
+        cross_prefix,
+        f"{train_key}_to_{test_key}_{split_name}_pca.parquet",
+    )
+
+    stats, categories, feature_columns = carregar_artefatos_preprocessamento(
+        artifact_path=train_dataset["ARTIFACT_PATH"],
+        dataset_name=train_key,
+    )
+
+    pca_paths = pca_artifact_paths(
+        artifact_path=train_dataset["ARTIFACT_PATH"],
+        dataset_name=train_key,
+    )
+
+    con = conectar_duckdb_s3()
+
+    try:
+        scaler_dataset(
+            con=con,
+            input_path=source_split,
+            output_path=processed_output,
+            numeric_features=numeric_features,
+            categorical_features=categorical_features,
+            stats=stats,
+            categories=categories,
+            target=target,
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix=f"{train_key}_cross_pca_",
+        ) as temp_dir:
+            local_pca = Path(temp_dir) / Path(pca_paths["pca"]).name
+            download_file_from_s3(pca_paths["pca"], local_pca)
+            pca = joblib.load(local_pca)
+
+            transformar_split_pca(
+                con=con,
+                input_path=processed_output,
+                output_path=pca_output,
+                pca=pca,
+                feature_columns=feature_columns,
+                target=target,
+                batch_size=batch_size,
+            )
+
+        print("Arquivos cross-domain gerados:", flush=True)
+        print(f"Processed: {processed_output}", flush=True)
+        print(f"PCA: {pca_output}", flush=True)
+        print("=" * 80, flush=True)
+
+        return processed_output, pca_output
 
     finally:
         con.close()
