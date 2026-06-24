@@ -15,7 +15,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from sklearn.decomposition import IncrementalPCA
 
-from .s3 import conectar_duckdb_s3, join_s3_path, sql_path, to_string, upload_file_to_s3
+from .s3 import (
+    conectar_duckdb_s3,
+    download_file_from_s3,
+    join_s3_path,
+    sql_path,
+    to_string,
+    upload_file_to_s3,
+    validar_objeto_s3,
+)
 
 
 def calcular_estatisticas_treino(
@@ -332,8 +340,64 @@ def converter_parquet(
 
         print(f"Terminou: {output_path}")
         print("=" * 80)
+        return
+    except Exception as exc:
+        print(
+            "DuckDB/httpfs falhou ao acessar o CSV no S3. "
+            "Validando o objeto com boto3 antes de tentar o fallback local...",
+            flush=True,
+        )
+        duckdb_error = exc
     finally:
         con.close()
+
+    try:
+        validar_objeto_s3(input_path)
+    except Exception as boto3_exc:
+        raise RuntimeError(
+            "Falha ao acessar o CSV no S3 tanto pelo DuckDB quanto pelo boto3. "
+            "Verifique endpoint, secrets S3_ACCESS_KEY/S3_SECRET_KEY, permissao "
+            f"no objeto e se o caminho existe: {input_path}"
+        ) from boto3_exc
+
+    print(
+        "Objeto validado com boto3. Tentando conversao por arquivo temporario local...",
+        flush=True,
+    )
+    converter_parquet_local_fallback(input_path, output_path)
+    print(
+        "Conversao concluida pelo fallback local apos falha do DuckDB/httpfs.",
+        flush=True,
+    )
+    print("=" * 80)
+    print(f"Erro original do DuckDB/httpfs: {duckdb_error}", flush=True)
+
+
+def converter_parquet_local_fallback(input_path: str, output_path: str) -> None:
+    """Converte CSV S3 para Parquet S3 usando arquivos temporarios locais."""
+    with tempfile.TemporaryDirectory(prefix="nids_csv_to_parquet_") as temp_dir:
+        temp_path = Path(temp_dir)
+        local_csv = temp_path / Path(input_path).name
+        local_parquet = temp_path / Path(output_path).name
+
+        download_file_from_s3(input_path, local_csv)
+
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"""
+                COPY (
+                    SELECT *
+                    FROM read_csv_auto('{sql_path(str(local_csv))}')
+                )
+                TO '{sql_path(str(local_parquet))}'
+                (FORMAT PARQUET, COMPRESSION 'ZSTD');
+                """
+            )
+        finally:
+            con.close()
+
+        upload_file_to_s3(local_parquet, output_path)
 
 
 def limpar_dataset(

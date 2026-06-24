@@ -167,6 +167,27 @@ def upload_file_to_s3(
     print(f"Artefato enviado: {s3_uri}", flush=True)
 
 
+def validar_objeto_s3(s3_uri: str, aws_region: str | None = None) -> None:
+    """Valida se um objeto S3 existe e esta acessivel via boto3."""
+    bucket, key = parse_s3_uri(s3_uri)
+    client = criar_cliente_s3(aws_region=aws_region)
+    client.head_object(Bucket=bucket, Key=key)
+
+
+def download_file_from_s3(
+    s3_uri: str,
+    local_path: str | Path,
+    aws_region: str | None = None,
+) -> None:
+    """Baixa um objeto S3 para um arquivo local."""
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    bucket, key = parse_s3_uri(s3_uri)
+    client = criar_cliente_s3(aws_region=aws_region)
+    print(f"Baixando {s3_uri} -> {local_path}", flush=True)
+    client.download_file(Bucket=bucket, Key=key, Filename=str(local_path))
+
 
 def join_s3_path(base_path: str, *parts: str) -> str:
     """Junta caminhos S3 evitando barras duplicadas.
